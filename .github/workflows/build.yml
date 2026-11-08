@@ -1,316 +1,309 @@
-name: build-defeatured-frida-17
+name: strongR-frida
 
 on:
-  workflow_dispatch: {}
-  push:
-    branches: [main]
+  schedule:
+    - cron: "0 9/12 * * *"
+  workflow_dispatch:
 
-env:
-  FRIDA_VERSION: "17.17.0"
+jobs: 
+  check_version:
+    runs-on: ubuntu-20.04
 
-jobs:
-  # =====================================================================
-  # Job 1: Android frida-server（去特征）—— --disable-gadget，参考项目已验证路径
-  # =====================================================================
-  android-server:
-    runs-on: ubuntu-latest
+    outputs:
+      FRIDA_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
+      ALREADY_RELEASE: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: 拉取 frida 源码 + 子模块
-        run: |
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida.git "$RUNNER_TEMP/frida"
-          cd "$RUNNER_TEMP/frida"
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-core.git subprojects/frida-core
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-gum.git  subprojects/frida-gum
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-python.git subprojects/frida-python
-          git submodule update --init --depth 1 releng
-          echo "FRIDA_DIR=$RUNNER_TEMP/frida" >> "$GITHUB_ENV"
-
-      - name: 应用去特征补丁 (de-frida.py)
-        run: |
-          cp "$GITHUB_WORKSPACE/de-frida.py" "$FRIDA_DIR/de-frida.py"
-          python3 "$FRIDA_DIR/de-frida.py"
-          H="$FRIDA_DIR/subprojects/frida-core/src/android-helper"
-          [ -d "$H/re/frida" ] && mv "$H/re/frida" "$H/re/gsvc" || true
-
-      - name: 重新生成 Android helper dex
-        run: |
-          cp "$GITHUB_WORKSPACE/tools/regenerate-helper-dex.sh" "$FRIDA_DIR/tools/regenerate-helper-dex.sh"
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          bash "$FRIDA_DIR/tools/regenerate-helper-dex.sh" \
-            || echo "::warning::helper dex 重生成失败（仅影响 spawn 模式，attach 可忽略）"
-
-      - name: 清理磁盘
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
-          echo "ANDROID_HOME=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
-          df -h / | tail -1
-
-      - name: 给 glib 打去特征补丁
-        run: |
-          GLIB_COMMIT=$(grep -A4 '^\[glib\]' "$FRIDA_DIR/releng/deps.toml" | grep '^version' | sed 's/version = "\([0-9a-f]*\)"/\1/')
-          GLIB_SRC="$FRIDA_DIR/subprojects/glib"
-          mkdir -p "$FRIDA_DIR/subprojects"
-          if [ ! -d "$GLIB_SRC/.git" ]; then
-            git clone --depth 1 https://github.com/frida/glib.git "$GLIB_SRC"
-            git -C "$GLIB_SRC" fetch --depth 1 origin "$GLIB_COMMIT"
-            git -C "$GLIB_SRC" checkout -q "$GLIB_COMMIT"
-          fi
-          sed -i 's/g_thread_new ("gmain"/g_thread_new ("evtloop"/' "$GLIB_SRC/glib/gmain.c"
-          sed -i 's/g_thread_new ("gdbus"/g_thread_new ("ipcbus"/' "$GLIB_SRC/gio/gdbusprivate.c"
-          grep -q 'g_thread_new ("evtloop"' "$GLIB_SRC/glib/gmain.c" && echo "glib: evtloop OK"
-
-      - name: 安装构建依赖
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-dev libpython3-dev python3-setuptools python3-wheel \
-            gperf bison flex gettext pkg-config cmake libtool autoconf automake
-
-      - name: 安装 Android NDK (r29, frida 17.17.0 要求)
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
+      - name: Pull Frida Latest Release
+        id: pullFridaLatestRelease
+        uses: actions/github-script@v3.1.0
         with:
-          ndk-version: r29
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const releaseResponse = await github.repos.getLatestRelease({
+              owner: 'frida',
+              repo: 'frida',
+            })
+            const {
+              data: { tag_name: ver }
+            } = releaseResponse;
+            core.setOutput('FRIDA_VERSION', ver);
+      - name: Check release version
+        id: checkReleaseVersion
+        uses: actions/github-script@v3.1.0
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            try {
+              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
+              const releaseResponse = await github.repos.getReleaseByTag({
+                owner: '${{ secrets.GIT_OWNER }}',
+                repo: '${{ secrets.GIT_REPO }}',
+                tag: releaseVersion
+              });
+              const {
+                data: { tag_name: ver }
+              } = releaseResponse;
+              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
+                  core.setOutput('ALREADY_RELEASE', '1');
+              }
+              else{
+                  core.setOutput('ALREADY_RELEASE', '0');
+              }
+            } catch (e) {
+              if(e.message == 'Not Found'){
+                core.setOutput('ALREADY_RELEASE', '0');
+              }
+              else{
+                core.setFailed(e.message);
+              }
+            }
 
-      - name: 写入 ANDROID_NDK_ROOT
-        run: echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      - name: 修复 Java bridge CModule 缺 stdarg.h/stddef.h
-        run: |
-          D="$FRIDA_DIR/subprojects/frida-gum/bindings/gumjs/runtime/cmodule-tcc"
-          cat > "$D/stdarg.h" << 'EOF'
-          #ifndef _STDARG_H
-          #define _STDARG_H
-          typedef __builtin_va_list va_list;
-          #define va_start __builtin_va_start
-          #define va_arg __builtin_va_arg
-          #define va_copy __builtin_va_copy
-          #define va_end __builtin_va_end
-          typedef va_list __gnuc_va_list;
-          #define _VA_LIST_DEFINED
-          #endif
-          EOF
-          cat > "$D/stddef.h" << 'EOF'
-          #ifndef _STDDEF_H
-          #define _STDDEF_H
-          typedef __SIZE_TYPE__ size_t;
-          typedef __PTRDIFF_TYPE__ ssize_t;
-          typedef __WCHAR_TYPE__ wchar_t;
-          typedef __PTRDIFF_TYPE__ ptrdiff_t;
-          typedef __PTRDIFF_TYPE__ intptr_t;
-          typedef __SIZE_TYPE__ uintptr_t;
-          #ifndef __int8_t_defined
-          #define __int8_t_defined
-          typedef signed char int8_t;
-          typedef signed short int int16_t;
-          typedef signed int int32_t;
-          typedef signed long long int int64_t;
-          typedef unsigned char uint8_t;
-          typedef unsigned short int uint16_t;
-          typedef unsigned int uint32_t;
-          typedef unsigned long long int uint64_t;
-          #endif
-          #ifndef NULL
-          #define NULL ((void*)0)
-          #endif
-          #undef offsetof
-          #define offsetof(type, field) ((size_t)&((type *)0)->field)
-          void *alloca(size_t size);
-          #endif
-          EOF
-          M="$FRIDA_DIR/subprojects/frida-gum/bindings/gumjs/meson.build"
-          grep -q "'cmodule-tcc' / 'stdarg.h'" "$M" \
-            || sed -i "s|'runtime' / 'cmodule-tcc' / 'inttypes.h',|'runtime' / 'cmodule-tcc' / 'inttypes.h',\n  'runtime' / 'cmodule-tcc' / 'stdarg.h',\n  'runtime' / 'cmodule-tcc' / 'stddef.h',|" "$M"
-          grep -q "'cmodule-tcc' / 'stdarg.h'" "$M" && echo "stdarg OK" \
-            || echo "::warning::stdarg 注册未命中"
+  create_release:
+    needs: check_version
+    runs-on: ubuntu-20.04
+    if: needs.check_version.outputs.ALREADY_RELEASE == '0'
 
-      - name: 构建 android-arm64 (frida-server, --disable-gadget)
-        run: |
-          cd "$FRIDA_DIR"
-          ./configure --without-prebuilds=sdk:host --disable-gadget --host=android-arm64
+    steps:
+      - uses: actions/create-release@master
+        id: createRelease
+        name: Create Runner Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
+          release_name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
+          prerelease: false
+
+  android_build:
+    runs-on: ubuntu-20.04
+    needs: [check_version, create_release]
+    strategy:
+      matrix:
+        arch: [x86, x86_64, arm, arm64]
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - uses: fusion-engineering/setup-git-credentials@v2
+      with:
+        credentials: ${{secrets.GIT_CREDENTIALS}}
+
+    - name: set up JDK 1.8
+      uses: actions/setup-java@v1
+      with:
+        java-version: 1.8
+
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1.0.6
+      with:
+        ndk-version: r25b
+    
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v5.1.0
+      with:
+        python-version: '3.9'
+
+    - name: install dependencies
+      run: |
+        sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install build-essential tree ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison xz-utils ruby ruby-dev python3-requests python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386 -y
+        sudo gem install fpm -v 1.11.0 --no-document
+        python3 -m pip install lief
+        python3 -m pip install graphlib
+
+    - name: build frida for Android
+      shell: bash
+      run: |
+        git config --global user.name "${{ secrets.GIT_NAME }}"
+        git config --global user.email "${{ secrets.GIT_EMAIL }}"
+        git clone ${{ secrets.PATCH_REPO }}
+        export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+        git clone --recurse-submodules https://github.com/frida/frida
+        cd frida/subprojects/frida-core
+        git am ../../../Patchs/strongR-frida/frida-core/*.patch
+    - name: two step patch   
+      shell: bash
+      run: |
+        cd frida/subprojects/frida-gum/gum
+        git am ../../../../Patchs/strongR-frida/frida-gum/*.patch
+        cd ../../../
+        
+    - name: Configure
+      shell: bash
+      run: |
+          cd frida
+          ./configure "--prefix=/home/runner/work/frida/dist" --host=android-${{ matrix.arch }} --enable-portal -- -Dfrida-gum:devkits=gum,gumjs -Dfrida-core:devkits=core
           make
 
-      - name: 收集产物
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find "$FRIDA_DIR" -type f -name 'frida-server' 2>/dev/null | while read -r f; do
-            cp "$f" "$GITHUB_WORKSPACE/artifacts/$(basename "$(dirname "$f")")-$(basename "$f")"
-            echo "已收集: $(basename "$f")"
-          done
-          ls -lh "$GITHUB_WORKSPACE/artifacts/"
+    - name: Check release version
+      id: checkReleaseVersion
+      uses: actions/github-script@v3.1.0
+      with:
+        github-token: ${{secrets.GITHUB_TOKEN}}
+        script: |
+          try {
+            const releaseVersion = '${{ needs.check_version.outputs.FRIDA_VERSION }}'
+            const releaseResponse = await github.repos.getReleaseByTag({
+              owner: '${{ secrets.GIT_OWNER }}',
+              repo: '${{ secrets.GIT_REPO }}',
+              tag: releaseVersion
+            })
+            const {
+              data: { id: releaseId, html_url: htmlUrl, upload_url: uploadUrl }
+            } = releaseResponse;
+            core.setOutput('id', releaseId);
+            core.setOutput('html_url', htmlUrl);
+            core.setOutput('upload_url', uploadUrl);
+            core.setOutput('version', releaseVersion);
+          } catch (e) {
+            core.setFailed(e.message);
+          }
+    - name: package build result for Android
+      shell: bash
+      run: |
+        pushd frida
+        
+        xz build/frida-android-arm/bin/frida-server
+        xz build/frida-android-arm64/bin/frida-server
+        
+        xz build/frida-android-x86/bin/frida-server
+        xz build/frida-android-x86_64/bin/frida-server
+        
+        xz build/frida-android-arm/bin/frida-inject
+        xz build/frida-android-arm64/bin/frida-inject
+        
+        xz build/frida-android-x86/bin/frida-inject
+        xz build/frida-android-x86_64/bin/frida-inject
+        
+        xz build/frida-android-arm/lib/frida/32/frida-gadget.so
+        xz build/frida-android-arm64/lib/frida/64/frida-gadget.so
+        
+        xz build/frida-android-x86/lib/frida/32/frida-gadget.so
+        xz build/frida-android-x86_64/lib/frida/64/frida-gadget.so
+        
+        popd
+        
+    - name: Upload android arm frida-server for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm/bin/frida-server.xz'
+        asset_name: 'hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz'
+        asset_content_type: application/octet-stream
 
-      - name: 上传 server 产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: frida-server-defeatured-17.17.0-android-arm64
-          path: artifacts/
-          retention-days: 7
+    - name: Upload android arm64 frida-server for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm64/bin/frida-server.xz'
+        asset_name: 'hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz'
+        asset_content_type: application/octet-stream
 
-  # =====================================================================
-  # Job 2: Android frida-gadget（去特征）—— 完整构建 + minizip 修复
-  # =====================================================================
-  android-gadget:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    - name: Upload android x86 frida-server for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86/bin/frida-server.xz'
+        asset_name: 'hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz'
+        asset_content_type: application/octet-stream
 
-      - name: 拉取 frida 源码 + 子模块
-        run: |
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida.git "$RUNNER_TEMP/frida"
-          cd "$RUNNER_TEMP/frida"
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-core.git subprojects/frida-core
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-gum.git  subprojects/frida-gum
-          git clone --depth 1 --branch "$FRIDA_VERSION" https://github.com/frida/frida-python.git subprojects/frida-python
-          git submodule update --init --depth 1 releng
-          echo "FRIDA_DIR=$RUNNER_TEMP/frida" >> "$GITHUB_ENV"
+    - name: Upload android x86_64 frida-server for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86_64/bin/frida-server.xz'
+        asset_name: 'hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz'
+        asset_content_type: application/octet-stream
+        
+    - name: Upload android arm frida-inject for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm/bin/frida-inject.xz'
+        asset_name: 'hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz'
+        asset_content_type: application/octet-stream
+        
+    - name: Upload android arm64 frida-inject for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm64/bin/frida-inject.xz'
+        asset_name: 'hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz'
+        asset_content_type: application/octet-stream
+        
+    - name: Upload android x86 frida-inject for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86/bin/frida-inject.xz'
+        asset_name: 'hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz'
+        asset_content_type: application/octet-stream
+        
+    - name: Upload android x86_64 frida-inject for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86_64/bin/frida-inject.xz'
+        asset_name: 'hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm-x86_64.xz'
+        asset_content_type: application/octet-stream
+    
+    - name: Upload android arm frida-gadget for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm/lib/frida/32/frida-gadget.so.xz'
+        asset_name: 'hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.xz'
+        asset_content_type: application/octet-stream
 
-      - name: 禁用 gadget 的 minizip 依赖（APK 资源读取功能，冷门特性；避免 minizip/zlib 交叉编译地狱）
-        run: |
-          # minizip 在 android 交叉编译下需要 zlib（--without-prebuilds 禁用了预编译 SDK），
-          # 且 frida 的 minizip-ng fork 有 zlib-ng/fseeko 兼容问题。禁用该依赖最稳妥。
-          # 1) gadget meson: 不再 --pkg=minizip / 不链接 minizip_dep
-          GADGET_M="$FRIDA_DIR/subprojects/frida-core/lib/gadget/meson.build"
-          sed -i "s|  extra_vala_args += '--pkg=minizip'|  # extra_vala_args += '--pkg=minizip' # 已禁用 minizip|" "$GADGET_M"
-          sed -i "s|  platform_deps += minizip_dep|  # platform_deps += minizip_dep # 已禁用 minizip|" "$GADGET_M"
-          grep -q "已禁用 minizip" "$GADGET_M" && echo "gadget meson: minizip 已禁用"
-          # 2) gadget.vala: maybe_load_asset_bytes_from_apk 改为直接返回 false（不再用 Minizip）
-          GADGET_V="$FRIDA_DIR/subprojects/frida-core/lib/gadget/gadget.vala"
-          python3 - "$GADGET_V" << 'PYEOF'
-          import re, sys
-          p = sys.argv[1]
-          s = open(p, encoding="utf-8").read()
-          pat = re.compile(
-              r'(maybe_load_asset_bytes_from_apk \([^)]*\) throws FileError \{\n)(.*?)(\n\t\}\n#endif)',
-              re.S)
-          s2, n = pat.subn(r'\1\t\tcontents = null;\n\t\treturn false; // minizip disabled\n\t}\n#endif', s)
-          if n != 1:
-              print("::warning::gadget.vala 未命中 maybe_load_asset_bytes_from_apk")
-          else:
-              open(p, "w", encoding="utf-8", newline="").write(s2)
-              print("gadget.vala: maybe_load_asset_bytes_from_apk 已禁用 minizip")
-          PYEOF
+    - name: Upload android arm64 frida-gadget for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-arm64/lib/frida/64/frida-gadget.so.xz'
+        asset_name: 'hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.xz'
+        asset_content_type: application/octet-stream
+   
+    - name: Upload android x86 frida-gadget for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86/lib/frida/32/frida-gadget.so.xz'
+        asset_name: 'hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.xz'
+        asset_content_type: application/octet-stream
 
-      - name: 应用去特征补丁 (de-frida.py)
-        run: |
-          cp "$GITHUB_WORKSPACE/de-frida.py" "$FRIDA_DIR/de-frida.py"
-          python3 "$FRIDA_DIR/de-frida.py"
-          H="$FRIDA_DIR/subprojects/frida-core/src/android-helper"
-          [ -d "$H/re/frida" ] && mv "$H/re/frida" "$H/re/gsvc" || true
-
-      - name: 重新生成 Android helper dex
-        run: |
-          cp "$GITHUB_WORKSPACE/tools/regenerate-helper-dex.sh" "$FRIDA_DIR/tools/regenerate-helper-dex.sh"
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          bash "$FRIDA_DIR/tools/regenerate-helper-dex.sh" \
-            || echo "::warning::helper dex 重生成失败（仅影响 spawn 模式，attach 可忽略）"
-
-      - name: 清理磁盘
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
-          echo "ANDROID_HOME=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
-          df -h / | tail -1
-
-      - name: 给 glib 打去特征补丁
-        run: |
-          GLIB_COMMIT=$(grep -A4 '^\[glib\]' "$FRIDA_DIR/releng/deps.toml" | grep '^version' | sed 's/version = "\([0-9a-f]*\)"/\1/')
-          GLIB_SRC="$FRIDA_DIR/subprojects/glib"
-          mkdir -p "$FRIDA_DIR/subprojects"
-          if [ ! -d "$GLIB_SRC/.git" ]; then
-            git clone --depth 1 https://github.com/frida/glib.git "$GLIB_SRC"
-            git -C "$GLIB_SRC" fetch --depth 1 origin "$GLIB_COMMIT"
-            git -C "$GLIB_SRC" checkout -q "$GLIB_COMMIT"
-          fi
-          sed -i 's/g_thread_new ("gmain"/g_thread_new ("evtloop"/' "$GLIB_SRC/glib/gmain.c"
-          sed -i 's/g_thread_new ("gdbus"/g_thread_new ("ipcbus"/' "$GLIB_SRC/gio/gdbusprivate.c"
-          grep -q 'g_thread_new ("evtloop"' "$GLIB_SRC/glib/gmain.c" && echo "glib: evtloop OK"
-
-      - name: 安装构建依赖
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq python3-dev libpython3-dev python3-setuptools python3-wheel \
-            gperf bison flex gettext pkg-config cmake libtool autoconf automake
-
-      - name: 安装 Android NDK (r29, frida 17.17.0 要求)
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r29
-
-      - name: 写入 ANDROID_NDK_ROOT
-        run: echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
-
-      - name: 修复 Java bridge CModule 缺 stdarg.h/stddef.h
-        run: |
-          D="$FRIDA_DIR/subprojects/frida-gum/bindings/gumjs/runtime/cmodule-tcc"
-          cat > "$D/stdarg.h" << 'EOF'
-          #ifndef _STDARG_H
-          #define _STDARG_H
-          typedef __builtin_va_list va_list;
-          #define va_start __builtin_va_start
-          #define va_arg __builtin_va_arg
-          #define va_copy __builtin_va_copy
-          #define va_end __builtin_va_end
-          typedef va_list __gnuc_va_list;
-          #define _VA_LIST_DEFINED
-          #endif
-          EOF
-          cat > "$D/stddef.h" << 'EOF'
-          #ifndef _STDDEF_H
-          #define _STDDEF_H
-          typedef __SIZE_TYPE__ size_t;
-          typedef __PTRDIFF_TYPE__ ssize_t;
-          typedef __WCHAR_TYPE__ wchar_t;
-          typedef __PTRDIFF_TYPE__ ptrdiff_t;
-          typedef __PTRDIFF_TYPE__ intptr_t;
-          typedef __SIZE_TYPE__ uintptr_t;
-          #ifndef __int8_t_defined
-          #define __int8_t_defined
-          typedef signed char int8_t;
-          typedef signed short int int16_t;
-          typedef signed int int32_t;
-          typedef signed long long int int64_t;
-          typedef unsigned char uint8_t;
-          typedef unsigned short int uint16_t;
-          typedef unsigned int uint32_t;
-          typedef unsigned long long int uint64_t;
-          #endif
-          #ifndef NULL
-          #define NULL ((void*)0)
-          #endif
-          #undef offsetof
-          #define offsetof(type, field) ((size_t)&((type *)0)->field)
-          void *alloca(size_t size);
-          #endif
-          EOF
-          M="$FRIDA_DIR/subprojects/frida-gum/bindings/gumjs/meson.build"
-          grep -q "'cmodule-tcc' / 'stdarg.h'" "$M" \
-            || sed -i "s|'runtime' / 'cmodule-tcc' / 'inttypes.h',|'runtime' / 'cmodule-tcc' / 'inttypes.h',\n  'runtime' / 'cmodule-tcc' / 'stdarg.h',\n  'runtime' / 'cmodule-tcc' / 'stddef.h',|" "$M"
-          grep -q "'cmodule-tcc' / 'stdarg.h'" "$M" && echo "stdarg OK" \
-            || echo "::warning::stdarg 注册未命中"
-
-      - name: 构建 android-arm64 (frida-server + frida-gadget)
-        run: |
-          cd "$FRIDA_DIR"
-          ./configure --without-prebuilds=sdk:host --host=android-arm64
-          make
-
-      - name: 收集产物
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find "$FRIDA_DIR" -type f \( -name 'frida-server' -o -name 'frida-gadget.so' -o -name 'frida-inject' \) 2>/dev/null | while read -r f; do
-            base="$(basename "$f")"
-            dir="$(basename "$(dirname "$f")")"
-            cp "$f" "$GITHUB_WORKSPACE/artifacts/${dir}-${base}"
-            echo "已收集: ${dir}-${base}"
-          done
-          ls -lh "$GITHUB_WORKSPACE/artifacts/"
-
-      - name: 上传 gadget 产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: frida-gadget-defeatured-17.17.0-android-arm64
-          path: artifacts/
-          retention-days: 7
+    - name: Upload android x86_64 frida-gadget for strongR-frida
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/frida/build/frida-android-x86_64/lib/frida/64/frida-gadget.so.xz'
+        asset_name: 'hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.xz'
+        asset_content_type: application/octet-stream
